@@ -1,0 +1,6 @@
+langgraph>=0.2.0
+langchain-google-genai>=2.0.0
+langchain-mcp-adapters>=0.1.0
+python-dotenv>=1.0.0
+huggingface_hub
+mcp<2.0

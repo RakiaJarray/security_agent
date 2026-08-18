@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.env
+data/cloudwatch_metrics.db
+eval_results.json
+eval_cloudanobench_results.json
+data/cloudanobench_raw/
+data/OmniAnomaly/
+src/__pycache__/
