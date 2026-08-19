@@ -7,14 +7,47 @@ disponible via `describe_metrics_schema` plutôt que de le supposer.
 
 Ce fichier remplace terme par terme la brique MCP_CONFIG de agent.py: au lieu
 de lancer `npx @executeautomation/database-server`, on lance ce serveur en
-stdio. Les tools additionnels (gpu_metrics, statistical_baseline_query, etc.)
-s'ajoutent ici au fur et à mesure -- un @mcp.tool() par tool, pas de
-consolidation en un seul "query anything".
+stdio. Les tools additionnels s'ajoutent ici au fur et à mesure -- un
+@mcp.tool() par tool, pas de consolidation en un seul "query anything".
+
+Tools exposés (5): describe_metrics_schema, get_metric_window,
+get_baseline_stats, evaluate_metric_window, list_instances.
+
+--- Historique de fusion (v2) ---
+v1 avait 7 tools. Deux paires ont été fusionnées pour réduire l'ambiguïté de
+sélection de tool par le LLM (au-delà d'une dizaine de tools, et surtout
+quand deux tools se chevauchent sémantiquement, la sélection se dégrade et
+le prompt doit compenser avec des paragraphes d'arbitrage -- signe qu'il
+fallait fusionner plutôt que documenter la distinction) :
+
+1. get_metric_points + get_correlated_metrics -> get_metric_window
+   get_correlated_metrics était un sur-ensemble strict de get_metric_points
+   (même requête, boucle sur 1 ou N métriques). Un seul tool qui accepte
+   `metric_names` en str OU liste supprime le choix ambigu.
+
+2. classify_trend + check_sustained_exceedance -> evaluate_metric_window
+   Les deux interrogeaient exactement la même fenêtre (même instance_id/
+   metric_name/end_timestamp/limit) pour calculer deux statistiques
+   différentes. Fusionnés en un seul tool à "deux phases" via le paramètre
+   optionnel `threshold` (fourni seulement après get_baseline_stats) --
+   garantit aussi que trend et exceedance portent sur EXACTEMENT la même
+   fenêtre (un seul fetch SQL).
+
+get_baseline_stats N'A PAS été fusionné avec les deux ci-dessus bien qu'il
+s'agisse aussi d'une requête sur fenêtre temporelle: il interroge une
+fenêtre ANTÉRIEURE (timestamp < before_timestamp) alors que les deux autres
+interrogent la fenêtre COURANTE (timestamp <= end_timestamp). Fusionner
+aurait cassé la garantie "le seuil est calculé sur la baseline, jamais sur
+la fenêtre suspecte elle-même" (cf. verifier.py) -- une confusion de fenêtre
+ici serait bien plus grave qu'une redondance de tool.
+
+Avant tout nouvel ajout de tool, vérifier qu'il ne chevauche pas
+sémantiquement un existant.
 
 Usage (test manuel):
     python metrics_mcp_server.py
 
-Intégration dans agent.py -- remplacer MCP_CONFIG par:
+Intégration dans agent.py -- MCP_CONFIG inchangé (même chemin de fichier):
     MCP_CONFIG = {
         "metrics-agent-tools": {
             "command": "python",
@@ -50,6 +83,7 @@ def _log_tool_call(tool_name: str, kwargs: dict, result_preview: str, duration_m
         file=sys.stderr, flush=True,
     )
 
+
 mcp = FastMCP("metrics-agent-tools")
 
 
@@ -62,10 +96,35 @@ def _query(sql: str, params: tuple = ()) -> list[tuple]:
     return rows
 
 
+def _fetch_window(instance_id: str, metric_name: str, end_timestamp: str | None,
+                   limit: int) -> list[tuple[str, float]]:
+    """
+    Helper interne partagé -- récupère les `limit` derniers points d'UNE
+    métrique, en ordre chronologique, optionnellement bornés par
+    end_timestamp. Utilisé par get_metric_window (par métrique) et par
+    evaluate_metric_window (fetch unique partagé entre trend et exceedance).
+    """
+    if end_timestamp:
+        rows = _query(
+            "SELECT timestamp, value FROM cloudwatch_metrics "
+            "WHERE instance_id = ? AND metric_name = ? AND timestamp <= ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (instance_id, metric_name, end_timestamp, limit),
+        )
+    else:
+        rows = _query(
+            "SELECT timestamp, value FROM cloudwatch_metrics "
+            "WHERE instance_id = ? AND metric_name = ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (instance_id, metric_name, limit),
+        )
+    return rows[::-1]  # ordre chronologique
+
+
 @mcp.tool()
 def describe_metrics_schema(instance_id: str) -> dict:
     """
-    Tool 1/N du Metrics Agent.
+    Tool 1/5 du Metrics Agent -- OBLIGATOIRE en premier.
 
     Renvoie les métriques réellement disponibles pour une instance donnée,
     sans supposer un schéma fixe -- indispensable pour généraliser au-delà
@@ -101,7 +160,7 @@ def describe_metrics_schema(instance_id: str) -> dict:
                        "ou utilise list_instances pour voir les instances disponibles.",
         }
         _log_tool_call("describe_metrics_schema", {"instance_id": instance_id},
-                        f"AUCUNE métrique trouvée", (time.perf_counter() - _t0) * 1000)
+                        "AUCUNE métrique trouvée", (time.perf_counter() - _t0) * 1000)
         return result
 
     n_points = {m: n for m, n, _, _ in rows}
@@ -123,74 +182,115 @@ def describe_metrics_schema(instance_id: str) -> dict:
 
 
 @mcp.tool()
-def get_metric_points(instance_id: str, metric_name: str, limit: int = 30,
-                       end_timestamp: str | None = None) -> dict:
+def get_metric_window(
+    instance_id: str,
+    metric_names: list[str] | str,
+    limit: int = 30,
+    end_timestamp: str | None = None,
+) -> dict:
     """
-    Tool 2/N du Metrics Agent -- remplace le SQL brut pour récupérer une
-    série temporelle. Renvoie les `limit` derniers points d'une métrique
-    pour une instance, en ordre chronologique, optionnellement bornés par
-    un timestamp de fin (pour rejouer une fenêtre passée plutôt que les
-    tout derniers points).
+    Tool 2/5 du Metrics Agent -- récupère une OU plusieurs métriques,
+    alignées sur la même fenêtre temporelle, en un seul appel.
+
+    Remplace les anciens get_metric_points / get_correlated_metrics: passe
+    une seule métrique (str) si tu dois isoler une série pour
+    evaluate_metric_window, ou une liste de métriques si describe_metrics_schema
+    a montré plus d'une métrique disponible -- certains patterns (crypto-mining,
+    DDoS, exfiltration de données) ne se voient que si plusieurs métriques
+    bougent EN MÊME TEMPS, ce qui est invisible en lisant les métriques une
+    par une. N'appelle JAMAIS ce tool en boucle une fois par métrique --
+    passe directement la liste complète en un seul appel.
 
     Args:
         instance_id: identifiant de l'instance/cas (voir describe_metrics_schema).
-        metric_name: nom exact de la métrique (voir describe_metrics_schema
-            pour la liste des métriques disponibles -- ne pas deviner).
-        limit: nombre de points à renvoyer (défaut 30).
+        metric_names: nom exact d'UNE métrique (str), ou liste de noms exacts
+            de plusieurs métriques (voir describe_metrics_schema pour la
+            liste des métriques disponibles -- ne jamais deviner un nom).
+        limit: nombre de points par métrique à renvoyer (défaut 30).
         end_timestamp: si fourni, ne renvoie que les points <= ce timestamp.
 
     Returns:
         {
-          "instance_id": ..., "metric_name": ...,
-          "points": [{"timestamp": "...", "value": ...}, ...]  # ordre chronologique
+          "instance_id": ...,
+          "metrics": {
+            "cpu_usage": [{"timestamp": "...", "value": ...}, ...],  # ordre chronologique
+            "net_in": [{"timestamp": "...", "value": ...}, ...],
+            ...
+          },
+          "aligned_timestamps": true/false  -- false si les métriques n'ont
+              pas exactement les mêmes timestamps (peut arriver si une
+              métrique a des trous) -- dans ce cas, comparer les métriques
+              par position relative dans la fenêtre plutôt que par égalité
+              stricte de timestamp.
         }
+        Si une métrique demandée n'existe pas pour cette instance, elle est
+        simplement absente de "metrics" (pas d'erreur bloquante) -- vérifie
+        les clés présentes avant de raisonner dessus.
     """
     _t0 = time.perf_counter()
-    if end_timestamp:
-        rows = _query(
-            "SELECT timestamp, value FROM cloudwatch_metrics "
-            "WHERE instance_id = ? AND metric_name = ? AND timestamp <= ? "
-            "ORDER BY timestamp DESC LIMIT ?",
-            (instance_id, metric_name, end_timestamp, limit),
-        )
-    else:
-        rows = _query(
-            "SELECT timestamp, value FROM cloudwatch_metrics "
-            "WHERE instance_id = ? AND metric_name = ? "
-            "ORDER BY timestamp DESC LIMIT ?",
-            (instance_id, metric_name, limit),
-        )
 
-    points = [{"timestamp": ts, "value": val} for ts, val in reversed(rows)]
+    if isinstance(metric_names, str):
+        metric_names = [metric_names]
 
-    call_kwargs = {"instance_id": instance_id, "metric_name": metric_name,
+    call_kwargs = {"instance_id": instance_id, "metric_names": metric_names,
                     "limit": limit, "end_timestamp": end_timestamp}
 
-    if not points:
+    if not metric_names:
         result = {
             "instance_id": instance_id,
-            "metric_name": metric_name,
-            "points": [],
-            "warning": "Aucun point trouvé -- vérifie le nom exact de la métrique via "
-                       "describe_metrics_schema (ne devine jamais un nom de métrique).",
+            "metrics": {},
+            "aligned_timestamps": True,
+            "warning": "Aucune métrique demandée -- utilise describe_metrics_schema "
+                       "d'abord pour connaître les métriques disponibles.",
         }
-        _log_tool_call("get_metric_points", call_kwargs, "AUCUN point trouvé",
-                        (time.perf_counter() - _t0) * 1000)
+        _log_tool_call("get_metric_window", call_kwargs,
+                        "aucune métrique demandée", (time.perf_counter() - _t0) * 1000)
         return result
 
+    metrics_out: dict[str, list[dict]] = {}
+    timestamp_sets = []
+
+    for metric_name in metric_names:
+        rows = _fetch_window(instance_id, metric_name, end_timestamp, limit)
+        if not rows:
+            continue  # métrique absente pour cette instance -- on l'omet simplement
+        points = [{"timestamp": ts, "value": val} for ts, val in rows]
+        metrics_out[metric_name] = points
+        timestamp_sets.append(tuple(p["timestamp"] for p in points))
+
+    if not metrics_out:
+        result = {
+            "instance_id": instance_id,
+            "metrics": {},
+            "aligned_timestamps": True,
+            "warning": "Aucun point trouvé pour les métriques demandées -- vérifie les "
+                       "noms exacts via describe_metrics_schema (ne devine jamais un nom).",
+        }
+        _log_tool_call("get_metric_window", call_kwargs,
+                        "AUCUN point trouvé", (time.perf_counter() - _t0) * 1000)
+        return result
+
+    aligned = len(set(timestamp_sets)) <= 1 if timestamp_sets else True
+
+    result = {
+        "instance_id": instance_id,
+        "metrics": metrics_out,
+        "aligned_timestamps": aligned,
+    }
     _log_tool_call(
-        "get_metric_points", call_kwargs,
-        f"{len(points)} points, {points[0]['timestamp']} -> {points[-1]['timestamp']}",
+        "get_metric_window", call_kwargs,
+        f"{len(metrics_out)} métrique(s) récupérée(s): {sorted(metrics_out.keys())}, "
+        f"aligned={aligned}",
         (time.perf_counter() - _t0) * 1000,
     )
-    return {"instance_id": instance_id, "metric_name": metric_name, "points": points}
+    return result
 
 
 @mcp.tool()
 def get_baseline_stats(instance_id: str, metric_name: str, before_timestamp: str,
                         window: int = 60) -> dict:
     """
-    Tool 3/N du Metrics Agent -- calcule une statistique de référence ("normale")
+    Tool 3/5 du Metrics Agent -- calcule une statistique de référence ("normale")
     sur une fenêtre ANTÉRIEURE à before_timestamp, pour donner à l'agent un seuil
     explicite calculé sur données réelles au lieu qu'il en invente un.
 
@@ -199,6 +299,11 @@ def get_baseline_stats(instance_id: str, metric_name: str, before_timestamp: str
     quelques points bruités. Le facteur 1.4826 rend le MAD comparable à un
     écart-type sous hypothèse de normalité (constante de consistance standard),
     ce qui permet d'exprimer un seuil "3 sigma" de façon robuste.
+
+    NE PAS fusionner ce tool avec evaluate_metric_window: il interroge une
+    fenêtre ANTÉRIEURE (timestamp < before_timestamp), jamais la fenêtre
+    suspecte elle-même -- sinon un spike prolongé finirait par devenir sa
+    propre "normalité" statistique et ne serait plus détectable.
 
     L'agent DOIT appeler ce tool avant de juger si une valeur observée est
     anormale, et reporter les valeurs renvoyées ici (pas des valeurs inventées)
@@ -246,7 +351,7 @@ def get_baseline_stats(instance_id: str, metric_name: str, before_timestamp: str
                 f"Historique insuffisant avant {before_timestamp} pour établir une "
                 f"baseline fiable ({len(rows)} points trouvés, {MIN_POINTS} minimum). "
                 f"Ne pas halluciner de seuil -- baser le jugement uniquement sur la "
-                f"forme de la série observée (get_metric_points)."
+                f"forme de la série observée (get_metric_window)."
             ),
             "n_points_used": len(rows),
         }
@@ -283,288 +388,157 @@ def get_baseline_stats(instance_id: str, metric_name: str, before_timestamp: str
 
 
 @mcp.tool()
-def check_sustained_exceedance(
-    instance_id: str,
-    metric_name: str,
-    threshold: float,
-    direction: str,
-    end_timestamp: str | None = None,
-    limit: int = 30,
-    min_consecutive: int = 3,
-) -> dict:
-    """
-    Tool 4/N du Metrics Agent -- vérifie si la fenêtre observée contient une
-    séquence d'au moins `min_consecutive` points CONSÉCUTIFS qui dépassent
-    `threshold` (direction='above') ou passent en-dessous (direction='below').
-
-    À utiliser TOUJOURS après get_baseline_stats: passe `threshold` =
-    suggested_threshold_high (pour direction='above', cas spike / gradual
-    increase) ou suggested_threshold_low (pour direction='below', cas dip /
-    gradual decrease).
-
-    L'agent NE DOIT JAMAIS compter les points consécutifs lui-même en lisant
-    le JSON de get_metric_points -- ce calcul est fait ici de façon
-    déterministe et doit être la seule source de vérité pour le champ
-    `evidence.points_above_threshold` de la sortie finale.
-
-    Args:
-        instance_id: identifiant de l'instance/cas.
-        metric_name: nom exact de la métrique (voir describe_metrics_schema).
-        threshold: seuil numérique à comparer -- typiquement
-            suggested_threshold_high ou suggested_threshold_low renvoyé par
-            get_baseline_stats. Ne jamais inventer cette valeur.
-        direction: "above" pour détecter un dépassement par le haut (spike,
-            gradual_increase), "below" pour un dépassement par le bas (dip,
-            gradual_decrease).
-        end_timestamp: si fourni, borne la fenêtre analysée (comme pour
-            get_metric_points) -- doit être cohérent avec la fenêtre déjà
-            récupérée à l'étape 1 du prompt.
-        limit: nombre de points de la fenêtre à analyser (défaut 30, doit
-            correspondre à la fenêtre déjà récupérée via get_metric_points).
-        min_consecutive: nombre minimal de points consécutifs requis pour
-            confirmer l'anomalie (défaut 3, conforme à la règle du prompt).
-
-    Returns:
-        {
-          "instance_id": ..., "metric_name": ...,
-          "direction": "above" | "below",
-          "threshold": ...,
-          "window_size": nombre de points analysés,
-          "longest_consecutive_run": longueur du plus long run trouvé,
-          "run_start_timestamp": timestamp de début de ce run (ou null),
-          "run_end_timestamp": timestamp de fin de ce run (ou null),
-          "passed": true si longest_consecutive_run >= min_consecutive,
-          "min_consecutive_required": min_consecutive
-        }
-    """
-    _t0 = time.perf_counter()
-
-    if direction not in ("above", "below"):
-        result = {
-            "instance_id": instance_id,
-            "metric_name": metric_name,
-            "error": f"direction invalide: '{direction}' -- doit être 'above' ou 'below'.",
-        }
-        _log_tool_call("check_sustained_exceedance", {"direction": direction},
-                        "ERREUR direction invalide", (time.perf_counter() - _t0) * 1000)
-        return result
-
-    if end_timestamp:
-        rows = _query(
-            "SELECT timestamp, value FROM cloudwatch_metrics "
-            "WHERE instance_id = ? AND metric_name = ? AND timestamp <= ? "
-            "ORDER BY timestamp DESC LIMIT ?",
-            (instance_id, metric_name, end_timestamp, limit),
-        )
-    else:
-        rows = _query(
-            "SELECT timestamp, value FROM cloudwatch_metrics "
-            "WHERE instance_id = ? AND metric_name = ? "
-            "ORDER BY timestamp DESC LIMIT ?",
-            (instance_id, metric_name, limit),
-        )
-
-    rows = rows[::-1]  # ordre chronologique, cohérent avec get_metric_points
-
-    call_kwargs = {
-        "instance_id": instance_id, "metric_name": metric_name,
-        "threshold": threshold, "direction": direction,
-        "end_timestamp": end_timestamp, "limit": limit,
-        "min_consecutive": min_consecutive,
-    }
-
-    if not rows:
-        result = {
-            "instance_id": instance_id,
-            "metric_name": metric_name,
-            "direction": direction,
-            "threshold": threshold,
-            "window_size": 0,
-            "longest_consecutive_run": 0,
-            "run_start_timestamp": None,
-            "run_end_timestamp": None,
-            "passed": False,
-            "min_consecutive_required": min_consecutive,
-            "warning": "Aucun point trouvé pour cette fenêtre -- vérifie instance_id/metric_name.",
-        }
-        _log_tool_call("check_sustained_exceedance", call_kwargs,
-                        "AUCUN point trouvé", (time.perf_counter() - _t0) * 1000)
-        return result
-
-    # Recherche du plus long run consécutif de points satisfaisant la condition.
-    def _satisfies(v: float) -> bool:
-        return v > threshold if direction == "above" else v < threshold
-
-    best_len = 0
-    best_start_idx = None
-    cur_len = 0
-    cur_start_idx = None
-
-    for i, (_, val) in enumerate(rows):
-        if _satisfies(val):
-            if cur_len == 0:
-                cur_start_idx = i
-            cur_len += 1
-            if cur_len > best_len:
-                best_len = cur_len
-                best_start_idx = cur_start_idx
-        else:
-            cur_len = 0
-            cur_start_idx = None
-
-    if best_start_idx is not None:
-        run_start_ts = rows[best_start_idx][0]
-        run_end_ts = rows[best_start_idx + best_len - 1][0]
-    else:
-        run_start_ts = None
-        run_end_ts = None
-
-    passed = best_len >= min_consecutive
-
-    result = {
-        "instance_id": instance_id,
-        "metric_name": metric_name,
-        "direction": direction,
-        "threshold": threshold,
-        "window_size": len(rows),
-        "longest_consecutive_run": best_len,
-        "run_start_timestamp": run_start_ts,
-        "run_end_timestamp": run_end_ts,
-        "passed": passed,
-        "min_consecutive_required": min_consecutive,
-    }
-    _log_tool_call(
-        "check_sustained_exceedance", call_kwargs,
-        f"longest_run={best_len} passed={passed} "
-        f"(seuil requis={min_consecutive}, direction={direction})",
-        (time.perf_counter() - _t0) * 1000,
-    )
-    return result
-
-
-@mcp.tool()
-def classify_trend(
+def evaluate_metric_window(
     instance_id: str,
     metric_name: str,
     end_timestamp: str | None = None,
     limit: int = 30,
     slope_ratio_threshold: float = 0.15,
+    threshold: float | None = None,
+    direction: str | None = None,
+    min_consecutive: int = 3,
 ) -> dict:
     """
-    Tool 5/N du Metrics Agent -- classe la fenêtre observée comme "stable" ou
-    "trending" (up/down) AVANT d'interpréter les seuils de get_baseline_stats.
+    Tool 4/5 du Metrics Agent -- analyse la fenêtre COURANTE d'une métrique en
+    UN SEUL appel. Fusionne ce qui était avant deux tools séparés (classify_trend
+    et check_sustained_exceedance), qui interrogeaient la même fenêtre deux fois
+    -- un seul fetch ici garantit que trend et exceedance portent sur EXACTEMENT
+    les mêmes points.
 
-    Pourquoi ce tool existe: get_baseline_stats calcule une médiane + MAD, ce
-    qui suppose implicitement que la série de référence oscille autour d'une
-    valeur centrale stable. Pour les patterns "gradual_increase" /
-    "gradual_decrease" (dérive lente et soutenue), cette hypothèse est fausse
-    -- une comparaison à un seuil fixe médiane+3*MAD peut soit rater une
-    dérive lente qui reste sous le seuil pendant longtemps, soit interpréter
-    à tort une dérive normale (ex: montée de charge progressive prévue) comme
-    un dépassement franc. classify_trend calcule une régression linéaire
-    simple sur la fenêtre et renvoie une pente normalisée, permettant à
-    l'agent de savoir AVANT d'interpréter les seuils si la série est stable
-    (comparer aux seuils MAD a du sens) ou en tendance (chercher une pente
-    soutenue plutôt qu'un dépassement de seuil ponctuel).
+    Ce tool s'utilise en DEUX PHASES, dans cet ordre :
 
-    À utiliser en complément de get_baseline_stats et check_sustained_exceedance,
-    typiquement juste après get_metric_points (étape 1) et avant d'interpréter
-    la baseline (étape 2).
+    PHASE 1 (obligatoire, avant get_baseline_stats) -- appelle SANS `threshold` :
+        evaluate_metric_window(instance_id, metric_name, end_timestamp, limit)
+    Renvoie uniquement la classification de tendance ("stable" / "trending_up"
+    / "trending_down") calculée par régression linéaire simple sur la fenêtre.
+    NE JUGE JAMAIS toi-même si une série "monte lentement" en lisant les valeurs
+    brutes -- utilise exclusivement le champ `classification` renvoyé ici.
+    Si "stable": une comparaison à médiane+3*MAD (get_baseline_stats puis
+    PHASE 2) a du sens. Si "trending_up"/"trending_down": privilégie le
+    pattern gradual_increase/gradual_decrease et utilise `normalized_slope`
+    comme preuve quantitative -- un seuil fixe peut être trompeur sur une
+    dérive lente.
+
+    PHASE 2 (obligatoire si un seuil a été obtenu via get_baseline_stats) --
+    rappelle ce même tool en fournissant `threshold` (= suggested_threshold_high
+    ou suggested_threshold_low renvoyé par get_baseline_stats) ET `direction`
+    ("above" pour un dépassement par le haut, "below" par le bas) :
+        evaluate_metric_window(instance_id, metric_name, end_timestamp, limit,
+                                threshold=..., direction=...)
+    Renvoie EN PLUS de la tendance le résultat de dépassement soutenu: `passed`
+    (bool) et `longest_consecutive_run` (nombre de points CONSÉCUTIFS au-delà
+    du seuil). NE COMPTE JAMAIS toi-même les points consécutifs en relisant le
+    JSON de get_metric_window -- ce comptage est fait ici de façon déterministe
+    et constitue ta SEULE source de vérité pour le champ
+    evidence.points_above_threshold de ta sortie finale.
 
     Args:
         instance_id: identifiant de l'instance/cas.
         metric_name: nom exact de la métrique (voir describe_metrics_schema).
-        end_timestamp: si fourni, borne la fenêtre analysée (cohérent avec la
-            fenêtre déjà récupérée via get_metric_points).
+        end_timestamp: si fourni, borne la fenêtre analysée (doit être cohérent
+            entre PHASE 1 et PHASE 2 -- même fenêtre).
         limit: nombre de points de la fenêtre à analyser (défaut 30, doit
-            correspondre à la fenêtre déjà récupérée via get_metric_points).
-        slope_ratio_threshold: seuil au-delà duquel la pente normalisée est
-            considérée comme une tendance plutôt que du bruit (défaut 0.15,
-            soit 15% de variation relative sur la fenêtre). Une valeur plus
-            basse rend la détection de tendance plus sensible.
+            rester identique entre PHASE 1 et PHASE 2).
+        slope_ratio_threshold: seuil de pente normalisée au-delà duquel la
+            fenêtre est classée "trending" plutôt que "stable" (défaut 0.15,
+            soit 15% de variation relative sur la fenêtre).
+        threshold: seuil numérique de dépassement (PHASE 2 uniquement) --
+            typiquement suggested_threshold_high/low de get_baseline_stats.
+            Laisser à None en PHASE 1. Ne jamais inventer cette valeur.
+        direction: "above" ou "below" (requis si `threshold` est fourni).
+        min_consecutive: nombre minimal de points consécutifs requis pour
+            confirmer l'anomalie (défaut 3, conforme à la règle du prompt).
 
-    Returns:
+    Returns (PHASE 1, threshold=None):
         {
-          "instance_id": ..., "metric_name": ...,
-          "window_size": nombre de points analysés,
-          "slope": pente brute (unité de la métrique par point),
-          "normalized_slope": pente normalisée (slope * window_size / mean),
-          "mean_value": moyenne de la fenêtre,
+          "instance_id": ..., "metric_name": ..., "window_size": ...,
+          "slope": ..., "normalized_slope": ..., "mean_value": ...,
           "classification": "stable" | "trending_up" | "trending_down",
-          "slope_ratio_threshold": valeur du seuil utilisé
+          "slope_ratio_threshold": ...,
+          "exceedance": null
         }
-        Si la fenêtre a moins de 2 points, renvoie un warning et
-        classification="stable" par défaut (pas assez de données pour juger
-        une tendance -- rester conservateur plutôt que d'halluciner une pente).
+
+    Returns (PHASE 2, threshold fourni) -- mêmes champs que ci-dessus, PLUS :
+        {
+          ...,
+          "exceedance": {
+            "threshold": ..., "direction": ...,
+            "longest_consecutive_run": ...,
+            "run_start_timestamp": ..., "run_end_timestamp": ...,
+            "passed": true/false,
+            "min_consecutive_required": ...
+          }
+        }
     """
     _t0 = time.perf_counter()
-
-    if end_timestamp:
-        rows = _query(
-            "SELECT timestamp, value FROM cloudwatch_metrics "
-            "WHERE instance_id = ? AND metric_name = ? AND timestamp <= ? "
-            "ORDER BY timestamp DESC LIMIT ?",
-            (instance_id, metric_name, end_timestamp, limit),
-        )
-    else:
-        rows = _query(
-            "SELECT timestamp, value FROM cloudwatch_metrics "
-            "WHERE instance_id = ? AND metric_name = ? "
-            "ORDER BY timestamp DESC LIMIT ?",
-            (instance_id, metric_name, limit),
-        )
-
-    rows = rows[::-1]  # ordre chronologique
 
     call_kwargs = {
         "instance_id": instance_id, "metric_name": metric_name,
         "end_timestamp": end_timestamp, "limit": limit,
         "slope_ratio_threshold": slope_ratio_threshold,
+        "threshold": threshold, "direction": direction,
+        "min_consecutive": min_consecutive,
     }
 
-    n = len(rows)
-    if n < 2:
+    if threshold is not None and direction not in ("above", "below"):
         result = {
             "instance_id": instance_id,
             "metric_name": metric_name,
-            "window_size": n,
+            "error": f"direction invalide: '{direction}' -- doit être 'above' ou 'below' "
+                     f"quand `threshold` est fourni (PHASE 2).",
+        }
+        _log_tool_call("evaluate_metric_window", call_kwargs,
+                        "ERREUR direction invalide", (time.perf_counter() - _t0) * 1000)
+        return result
+
+    rows = _fetch_window(instance_id, metric_name, end_timestamp, limit)
+    n = len(rows)
+
+    if n == 0:
+        result = {
+            "instance_id": instance_id,
+            "metric_name": metric_name,
+            "window_size": 0,
             "slope": None,
             "normalized_slope": None,
             "mean_value": None,
             "classification": "stable",
             "slope_ratio_threshold": slope_ratio_threshold,
-            "warning": "Moins de 2 points disponibles -- impossible de calculer une "
-                       "pente fiable, classification par défaut 'stable'.",
+            "exceedance": None,
+            "warning": "Aucun point trouvé pour cette fenêtre -- vérifie instance_id/metric_name "
+                       "via describe_metrics_schema.",
         }
-        _log_tool_call("classify_trend", call_kwargs,
-                        "insuffisant, defaut stable", (time.perf_counter() - _t0) * 1000)
+        _log_tool_call("evaluate_metric_window", call_kwargs,
+                        "AUCUN point trouvé", (time.perf_counter() - _t0) * 1000)
         return result
 
-    values = [v for _, v in rows]
-
-    # Régression linéaire simple (moindres carrés) sur l'indice de position
-    # (0..n-1) plutôt que sur le timestamp brut -- les points sont supposés
-    # régulièrement espacés (cohérent avec le reste du pipeline, cf.
-    # get_metric_points qui ne fait aucune interpolation).
-    x_mean = (n - 1) / 2.0
-    y_mean = sum(values) / n
-
-    numerator = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(values))
-    denominator = sum((i - x_mean) ** 2 for i in range(n))
-    slope = numerator / denominator if denominator > 0 else 0.0
-
-    # Pente normalisée: variation totale sur la fenêtre, rapportée à la
-    # moyenne -- rend le seuil comparable indépendamment de l'échelle de la
-    # métrique (CPU en % vs bytes réseau, par exemple).
-    total_variation = slope * (n - 1)
-    normalized_slope = total_variation / y_mean if y_mean != 0 else 0.0
-
-    if abs(normalized_slope) < slope_ratio_threshold:
+    # --- Partie 1: classification de tendance (toujours calculée) ---
+    if n < 2:
         classification = "stable"
-    elif normalized_slope > 0:
-        classification = "trending_up"
+        slope = None
+        normalized_slope = None
+        y_mean = rows[0][1] if rows else None
+        trend_warning = ("Moins de 2 points disponibles -- impossible de calculer une "
+                          "pente fiable, classification par défaut 'stable'.")
     else:
-        classification = "trending_down"
+        values = [v for _, v in rows]
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(values) / n
+
+        numerator = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(values))
+        denominator = sum((i - x_mean) ** 2 for i in range(n))
+        slope = numerator / denominator if denominator > 0 else 0.0
+
+        total_variation = slope * (n - 1)
+        normalized_slope = total_variation / y_mean if y_mean != 0 else 0.0
+
+        if abs(normalized_slope) < slope_ratio_threshold:
+            classification = "stable"
+        elif normalized_slope > 0:
+            classification = "trending_up"
+        else:
+            classification = "trending_down"
+        trend_warning = None
 
     result = {
         "instance_id": instance_id,
@@ -575,10 +549,58 @@ def classify_trend(
         "mean_value": y_mean,
         "classification": classification,
         "slope_ratio_threshold": slope_ratio_threshold,
+        "exceedance": None,
     }
+    if trend_warning:
+        result["warning"] = trend_warning
+
+    # --- Partie 2: dépassement soutenu (seulement si threshold fourni -- PHASE 2) ---
+    if threshold is not None:
+        def _satisfies(v: float) -> bool:
+            return v > threshold if direction == "above" else v < threshold
+
+        best_len = 0
+        best_start_idx = None
+        cur_len = 0
+        cur_start_idx = None
+
+        for i, (_, val) in enumerate(rows):
+            if _satisfies(val):
+                if cur_len == 0:
+                    cur_start_idx = i
+                cur_len += 1
+                if cur_len > best_len:
+                    best_len = cur_len
+                    best_start_idx = cur_start_idx
+            else:
+                cur_len = 0
+                cur_start_idx = None
+
+        if best_start_idx is not None:
+            run_start_ts = rows[best_start_idx][0]
+            run_end_ts = rows[best_start_idx + best_len - 1][0]
+        else:
+            run_start_ts = None
+            run_end_ts = None
+
+        passed = best_len >= min_consecutive
+
+        result["exceedance"] = {
+            "threshold": threshold,
+            "direction": direction,
+            "longest_consecutive_run": best_len,
+            "run_start_timestamp": run_start_ts,
+            "run_end_timestamp": run_end_ts,
+            "passed": passed,
+            "min_consecutive_required": min_consecutive,
+        }
+
     _log_tool_call(
-        "classify_trend", call_kwargs,
-        f"classification={classification} normalized_slope={normalized_slope:.3f}",
+        "evaluate_metric_window", call_kwargs,
+        f"classification={classification}"
+        + (f" passed={result['exceedance']['passed']} "
+           f"run={result['exceedance']['longest_consecutive_run']}"
+           if result["exceedance"] else " (phase 1, pas de seuil)"),
         (time.perf_counter() - _t0) * 1000,
     )
     return result
@@ -587,9 +609,9 @@ def classify_trend(
 @mcp.tool()
 def list_instances(limit: int = 50) -> list[str]:
     """
-    Liste les instance_id disponibles dans la base courante (utile pour
-    l'agent s'il doit explorer avant de recevoir une instance précise en
-    consigne, ou pour du debug manuel).
+    Tool 5/5 -- liste les instance_id disponibles dans la base courante
+    (utile pour l'agent s'il doit explorer avant de recevoir une instance
+    précise en consigne, ou pour du debug manuel).
     """
     rows = _query(
         "SELECT DISTINCT instance_id FROM cloudwatch_metrics ORDER BY instance_id LIMIT ?",
