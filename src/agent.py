@@ -1,28 +1,19 @@
 """
-Metrics Agent -- agent ReAct (LangGraph) + Gemini 2.5 Flash servi via
-OpenRouter, connecté au serveur MCP maison (metrics_mcp_server.py) exposant
-des tools métier sur data/cloudwatch_metrics.db.
+Metrics Agent -- agent ReAct (LangGraph) + Gemini 2.5 Flash via l'API Google
+directe (Google AI Studio), connecté au serveur MCP maison
+(metrics_mcp_server.py) exposant des tools métier sur data/cloudwatch_metrics.db.
 
-Pourquoi OpenRouter plutôt que l'API Google directe: un seul point d'accès/
-une seule clé pour tous les providers (utile si on veut comparer Gemini à
-d'autres modèles sans réécrire l'intégration), failover automatique entre
-plusieurs providers Google (AI Studio / Vertex) si l'un tombe, billing
-unifié. Le prix par token pour Gemini 2.5 Flash est identique à l'API Google
-directe -- pas de surcoût.
-
-Client HTTP: on utilise `langchain_openai.ChatOpenAI` pointé vers l'endpoint
-OpenRouter (`base_url=".../api/v1"`) plutôt que le package `langchain_openrouter`
--- ce dernier est peu maintenu et casse avec les versions récentes de pydantic
-(erreur `PydanticUserError: non-annotated attribute 'URL'` sur pydantic>=2.10).
-OpenRouter expose une API compatible OpenAI, donc ChatOpenAI fonctionne
-directement sans rien perdre en fonctionnalité (tool calling, streaming, etc.).
+Client HTTP: on utilise `langchain_google_genai.ChatGoogleGenerativeAI`, le
+wrapper officiel LangChain pour l'API Google Generative AI (Gemini). Appel
+direct à `generativelanguage.googleapis.com`, sans intermédiaire -- une seule
+clé `GOOGLE_API_KEY` (créée sur aistudio.google.com/apikey).
 
 L'agent utilise les tools MCP pour interroger la table `cloudwatch_metrics`
 avant de rendre son verdict structuré.
 
 Prérequis:
-    export OPENROUTER_API_KEY="..."      # clé OpenRouter (openrouter.ai/keys)
-    pip install langchain-openai         # cf. requirements.txt
+    export GOOGLE_API_KEY="..."          # clé Google AI Studio
+    pip install langchain-google-genai   # cf. requirements.txt
 
 Usage:
     python agent.py --instance ec2_cpu_utilization_24ae8d --metric CPUUtilization
@@ -35,11 +26,9 @@ import re
 import sys
 import time
 
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 sys.path.insert(0, os.path.dirname(__file__))
 from prompt import METRICS_AGENT_SYSTEM_PROMPT
@@ -57,10 +46,9 @@ MCP_CONFIG = {
 
 def normalize_content(content) -> str:
     """
-    Certains providers (selon le modèle routé par OpenRouter) peuvent
-    renvoyer le contenu du message sous forme de liste de blocs (ex:
-    [{"type": "text", "text": "..."}]) plutôt qu'une simple string -- on
-    normalise ici.
+    Le contenu du message peut être renvoyé sous forme de liste de blocs
+    (ex: [{"type": "text", "text": "..."}]) plutôt qu'une simple string,
+    selon la version du SDK Gemini -- on normalise ici.
     """
     if isinstance(content, str):
         return content
@@ -86,11 +74,9 @@ def extract_json(content) -> dict:
 
 def _extract_retry_delay(message: str) -> int:
     """
-    Cherche un délai de retry explicite dans le message d'erreur brut. Le
-    format exact dépend du provider sous-jacent que OpenRouter a routé (Google
-    AI Studio vs Vertex) -- on couvre les variantes usuelles ('retryDelay'
-    façon Google, 'try again in Xs' façon générique) plutôt que de supposer
-    un seul format fixe.
+    Cherche un délai de retry explicite dans le message d'erreur brut renvoyé
+    par l'API Google (ex: `retryDelay: "23s"` dans le détail RESOURCE_EXHAUSTED).
+    On couvre aussi une variante générique ('try again in Xs') par sécurité.
     """
     match = re.search(r"retryDelay['\"]?\s*:\s*['\"](\d+)s", message)
     if match:
@@ -106,8 +92,7 @@ def _classify_quota_error(message: str) -> str:
     Distingue RPM/TPM (par minute, se résout en attendant) de RPD (par jour,
     ne se résout PAS en attendant quelques secondes). Reste basé sur des
     mots-clés dans le message brut plutôt qu'un format d'erreur figé, car
-    OpenRouter peut relayer l'erreur telle quelle depuis le provider
-    (Google) ou lever sa propre erreur de rate-limit OpenRouter.
+    Google fait varier la formulation exacte selon le type de quota touché.
     """
     lowered = message.lower()
     if "perday" in lowered or "per_day" in lowered or "rpd" in lowered or "daily" in lowered:
@@ -121,8 +106,8 @@ def _classify_quota_error(message: str) -> str:
 
 async def _ainvoke_with_retry(agent, payload, max_retries: int = 6):
     """
-    Réessaie l'appel agent en cas de 429 (rate limit), qu'il vienne
-    d'OpenRouter lui-même ou soit relayé depuis le provider sous-jacent.
+    Réessaie l'appel agent en cas de 429 / RESOURCE_EXHAUSTED (rate limit ou
+    quota) renvoyé directement par l'API Google.
     """
     for attempt in range(max_retries):
         try:
@@ -188,28 +173,32 @@ def _print_tool_call_trace(messages: list) -> None:
 async def run_metrics_agent(
     instance_id: str, metric_name: str, end_timestamp: str | None = None
 ) -> dict:
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        raise RuntimeError("OPENROUTER_API_KEY non défini. export OPENROUTER_API_KEY=...")
+    if not os.environ.get("GOOGLE_API_KEY"):
+        raise RuntimeError("GOOGLE_API_KEY non défini. export GOOGLE_API_KEY=...")
 
-    # google/gemini-2.5-flash: identifiant du modèle côté OpenRouter (préfixe
-    # "google/" obligatoire -- différent de l'identifiant "gemini-2.5-flash"
-    # utilisé avec l'API Google directe). Même modèle, même tarif par token,
-    # cf. docstring du module. Surcharge possible via OPENROUTER_MODEL.
-    model_name = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
-    # max_tokens: sans cette borne explicite, ChatOpenAI ne fixe rien et
-    # OpenRouter facture/réserve jusqu'au plafond théorique du modèle
-    # (65535 tokens) à CHAQUE appel -- y compris les tool calls intermédiaires
-    # de la boucle ReAct, pas seulement le JSON final. Le JSON de sortie de
-    # cet agent tient dans quelques centaines de tokens ; 4096 laisse une
-    # large marge pour le raisonnement + les tool calls sans épuiser le
-    # crédit sur un compte gratuit. Ajustable via OPENROUTER_MAX_TOKENS.
-    max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", "4096"))
-    llm = ChatOpenAI(
+    # "gemini-3.6-flash": identifiant stable côté API Google directe.
+    # gemini-2.5-flash n'est plus accessible aux nouvelles clés API (Google
+    # redirige vers ce modèle). Surcharge possible via GOOGLE_MODEL.
+    #
+    # NB: à partir de Gemini 3.6 Flash, Google déprécie les paramètres
+    # d'échantillonnage (temperature/top_p/top_k) -- ils sont silencieusement
+    # ignorés par l'API pour ce modèle (pas d'erreur). On les laisse dans le
+    # code pour rester compatible si GOOGLE_MODEL pointe vers un modèle plus
+    # ancien qui les respecte encore.
+    model_name = os.environ.get("GOOGLE_MODEL", "gemini-3.6-flash")
+    # max_output_tokens: sans cette borne explicite, le SDK ne fixe rien et
+    # l'appel peut réserver jusqu'au plafond théorique du modèle à CHAQUE
+    # appel -- y compris les tool calls intermédiaires de la boucle ReAct,
+    # pas seulement le JSON final. Le JSON de sortie de cet agent tient dans
+    # quelques centaines de tokens ; 4096 laisse une large marge pour le
+    # raisonnement + les tool calls sans épuiser le crédit sur un compte
+    # gratuit. Ajustable via GOOGLE_MAX_OUTPUT_TOKENS.
+    max_output_tokens = int(os.environ.get("GOOGLE_MAX_OUTPUT_TOKENS", "4096"))
+    llm = ChatGoogleGenerativeAI(
         model=model_name,
         temperature=0,
-        max_tokens=max_tokens,
-        api_key=os.environ["OPENROUTER_API_KEY"],
-        base_url=OPENROUTER_BASE_URL,
+        max_output_tokens=max_output_tokens,
+        google_api_key=os.environ["GOOGLE_API_KEY"],
     )
 
     client = MultiServerMCPClient(MCP_CONFIG)
