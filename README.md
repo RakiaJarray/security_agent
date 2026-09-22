@@ -1,1 +1,1 @@
-# Multi-branch neural network IDS for network traffi
+# Multi-branch neural network IDS for network traffic
